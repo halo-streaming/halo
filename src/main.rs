@@ -43,6 +43,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match cli.command {
         Commands::Publish { video_path } => {
             eprintln!("Publishing {video_path}");
+            halo_core::publisher::publish(&video_path).await?;
         },
         Commands::Subscribe { ticket } => {
             // Printing anything to stdout can corrupt the pipe to ffplay
