@@ -6,16 +6,17 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
+use local_ip_address::local_ip;
 use mp4::ReadBox;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{Notify, broadcast, watch};
 
 use moq_native_ietf::{quic, tls};
 use moq_transport::{
     coding::TrackNamespace,
     serve,
-    session::{transport::Session as TransportSession, Publisher, Transport},
+    session::{Publisher, Transport, transport::Session as TransportSession},
 };
 
 const DEFAULT_PORT: u16 = 4443;
@@ -45,7 +46,7 @@ struct Hub {
     first_peer: Notify,
 }
 
-pub async fn publish(file: &str) -> Result<()> {
+pub async fn publish(file: &str, node_id: [u8; 32]) -> Result<()> {
     // Is path valid?
     let path = Path::new(file);
     // Doesn't verify if it's real mp4 tho
@@ -56,7 +57,10 @@ pub async fn publish(file: &str) -> Result<()> {
     let (cert, key) = write_self_signed(dir.path())?;
 
     // Configure TLS arguments (no verification)
-    let mut tls_args = tls::Args {disable_verify: true, ..Default::default()};
+    let mut tls_args = tls::Args {
+        disable_verify: true,
+        ..Default::default()
+    };
     tls_args.cert.push(cert);
     tls_args.key.push(key);
     let tls = tls_args.load()?;
@@ -66,9 +70,13 @@ pub async fn publish(file: &str) -> Result<()> {
     let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
     let quic_config = quic::Config::new(v4, None, tls)?;
     let endpoint = quic::Endpoint::new(quic_config)?;
-    
+
     let server = endpoint.server.context("TLS config missing")?;
     tracing::info!(listen = %server.local_addr()?, file=%path.display(), "publishing, waiting for subscribers");
+    let ip = local_ip().context("failed to determine the publisher IP")?;
+    let ticket = crate::halo_protocol::node::encode_ticket(&node_id, ip);
+    tracing::info!(ticket = %ticket, "publisher join ticket");
+    eprintln!("Publisher ticket: {ticket}");
 
     // The init segment is shared for all subscribers so they can decode the stream properly
     let (init, _) = watch::channel(None); // It gets populated when the first subscriber comes
@@ -82,7 +90,7 @@ pub async fn publish(file: &str) -> Result<()> {
 
     return tokio::select! {
         res = accept_loop(server, hub.clone()) => res,
-        res = run_ffmpeg(path, hub) => res, 
+        res = run_ffmpeg(path, hub) => res,
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
 }
@@ -114,9 +122,15 @@ async fn accept_loop(mut server: quic::Server, hub: Arc<Hub>) -> Result<()> {
 }
 
 /// Serve one subscriber with its own broadcast so it always get the init segment (ftyp + moov)
-async fn serve_peer(session: TransportSession, transport: Transport, hub: Arc<Hub>, name: String) -> Result<()> {
+async fn serve_peer(
+    session: TransportSession,
+    transport: Transport,
+    hub: Arc<Hub>,
+    name: String,
+) -> Result<()> {
     let (session, mut publisher) = Publisher::accept(session, transport)
-        .await.context("MoQ setup failed")?;
+        .await
+        .context("MoQ setup failed")?;
 
     hub.first_peer.notify_one();
 
@@ -149,9 +163,15 @@ async fn wait_for_init(hub: &Hub) -> Result<Bytes> {
 /// Feed one subscriber's "Media".
 /// Feeds init segment (with codec info, etc. to understand the coming data)
 /// Then live fragments starting from a keyframe.
-async fn feed_peer(mut media: moq_pub::Media, hub: Arc<Hub>, mut live: broadcast::Receiver<Fragment>) -> Result<()> {
+async fn feed_peer(
+    mut media: moq_pub::Media,
+    hub: Arc<Hub>,
+    mut live: broadcast::Receiver<Fragment>,
+) -> Result<()> {
     let mut init = wait_for_init(&hub).await?;
-    media.parse(&mut init).context("failed to publish the init segment")?;
+    media
+        .parse(&mut init)
+        .context("failed to publish the init segment")?;
 
     let mut started = false;
     loop {
@@ -159,7 +179,9 @@ async fn feed_peer(mut media: moq_pub::Media, hub: Arc<Hub>, mut live: broadcast
             Ok(mut fragment) => {
                 started |= fragment.keyframe;
                 if started {
-                    media.parse(&mut fragment.data).context("failed to publish a fragment")?;
+                    media
+                        .parse(&mut fragment.data)
+                        .context("failed to publish a fragment")?;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -180,7 +202,8 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner", // no copyright/version
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
             "-re", // read input at native frame rate
             "-stream_loop",
             "-1",
@@ -188,19 +211,26 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
         ])
         .arg(file)
         .args([
-            "-an",
             "-c:v",
             "libx264",
             "-profile:v",
             "main",
-            "-preset","veryfast",
-            "-tune","zerolatency",
-            "-pix_fmt","yuv420p",
-            "-g","48",
-            "-keyint_min","48",
-            "-sc_threshold","0",
-            "-f","mp4",
-            "-movflags","empty_moov+frag_every_frame+separate_moof+omit_tfhd_offset",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "48",
+            "-keyint_min",
+            "48",
+            "-sc_threshold",
+            "0",
+            "-f",
+            "mp4",
+            "-movflags",
+            "empty_moov+frag_every_frame+separate_moof+omit_tfhd_offset",
             "-",
         ])
         .stdin(Stdio::null())
@@ -271,7 +301,8 @@ fn next_box(buf: &mut BytesMut) -> Result<Option<Bytes>> {
     // Size is encoded as a big endian integer
     let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     anyhow::ensure!(size >= 8, "unsupported MP4 box size {size}");
-    if buf.len() < size { // The buffer doesn't contain the whole box yet
+    if buf.len() < size {
+        // The buffer doesn't contain the whole box yet
         return Ok(None);
     }
     // We return the box as immutable bytes and chop it off "buf" so it only contains the next stuff.
