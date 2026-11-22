@@ -13,7 +13,7 @@ pub struct Ticket {
 
 /// Encode a HALO join ticket.
 ///
-/// format: version (1 byte), NodeID (32 bytes), IP version (1 byte) as defined in the HALO protocol, 
+/// format: version (1 byte), NodeID (32 bytes), IP version (1 byte) as defined in the HALO protocol,
 /// and the IP address (4 bytes for IPv4 or 16 bytes for IPv6).
 pub fn encode_ticket(node_id: &[u8; 32], ip: IpAddr) -> String {
     let mut bytes = Vec::with_capacity(38);
@@ -73,24 +73,6 @@ pub fn decode_ticket(ticket: &str) -> Result<Ticket> {
 pub fn parse_ticket(ticket: &str) -> Result<SocketAddr> {
     let ticket = decode_ticket(ticket)?;
     Ok(SocketAddr::new(ticket.ip, DEFAULT_PORT))
-}
-
-/// Transform an IP/PORT string to a SocketAddr structure.
-pub fn parse_ip_port(s: &str) -> Result<SocketAddr, String> {
-    if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    let (host, port) = s
-        .rsplit_once('/')
-        .ok_or_else(|| "expected IP/PORT".to_string())?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|e| format!("invalid IP address {host:?}: {e}"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|e| format!("invalid port {port:?}: {e}"))?;
-    Ok(SocketAddr::new(ip, port))
 }
 
 #[cfg(test)]

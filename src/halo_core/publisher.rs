@@ -1,12 +1,12 @@
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use local_ip_address::local_ip;
+use local_ip_address::{local_ip, local_ipv6};
 use mp4::ReadBox;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -67,13 +67,17 @@ pub async fn publish(file: &str, node_id: [u8; 32]) -> Result<()> {
 
     // Prepare a raw QUIC endpoint (like subscriber)
     // 0.0.0.0:4443 (ipv4 only)
-    let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
-    let quic_config = quic::Config::new(v4, None, tls)?;
+    // let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
+
+    // Using ipv6 because each device has its own unique 128-bit address (no address translation)
+    let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
+
+    let quic_config = quic::Config::new(bind, None, tls)?;
     let endpoint = quic::Endpoint::new(quic_config)?;
 
     let server = endpoint.server.context("TLS config missing")?;
     tracing::info!(listen = %server.local_addr()?, file=%path.display(), "publishing, waiting for subscribers");
-    let ip = local_ip().context("failed to determine the publisher IP")?;
+    let ip = local_ipv6().context("failed to determine the publisher IP")?;
     let ticket = crate::halo_protocol::node::encode_ticket(&node_id, ip);
     tracing::info!(ticket = %ticket, "publisher join ticket");
     eprintln!("Publisher ticket: {ticket}");
@@ -211,29 +215,43 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
         ])
         .arg(file)
         .args([
-            "-map", "0:v:0",
-            "-map", "0:a:0?", // "?" = we can have an audio track, or not
-
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?", // "?" = we can have an audio track, or not
             // Video track flags
-            "-c:v", "libx264", // codec = H.264
-            "-profile:v", "main",
-            "-preset","veryfast",
-            "-tune","zerolatency",
-            "-pix_fmt","yuv420p", // pixel format
-            "-g","48", // GOP (group of pictures) size. always begins with an I-frame (keyframe)
-            "-keyint_min","48", // minimum interval between I-frames
-            "-sc_threshold","0",
-
+            "-c:v",
+            "libx264", // codec = H.264
+            "-profile:v",
+            "main",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p", // pixel format
+            "-g",
+            "48", // GOP (group of pictures) size. always begins with an I-frame (keyframe)
+            "-keyint_min",
+            "48", // minimum interval between I-frames
+            "-sc_threshold",
+            "0",
             // Audio track flags
-            // the moq-pub crate supports only the AAC codec 
-            "-c:a", "aac", // codec
-            "-b:a", "128k", // bitrate (128kbps)
-            "-ar", "48000", // sampling frequency
-            "-ac", "2", // number of audio channels (2 = stereo)
-
-            "-f","mp4",
-            "-movflags","empty_moov+separate_moof+omit_tfhd_offset",
-            "-frag_duration", "1000",
+            // the moq-pub crate supports only the AAC codec
+            "-c:a",
+            "aac", // codec
+            "-b:a",
+            "128k", // bitrate (128kbps)
+            "-ar",
+            "48000", // sampling frequency
+            "-ac",
+            "2", // number of audio channels (2 = stereo)
+            "-f",
+            "mp4",
+            "-movflags",
+            "empty_moov+separate_moof+omit_tfhd_offset",
+            "-frag_duration",
+            "1000",
             "-",
         ])
         .stdin(Stdio::null())
