@@ -6,7 +6,7 @@ use rand::rngs::OsRng;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 /// An Ed25519 keypair. The public key is used as a NodeID.
 pub struct Keypair {
@@ -55,10 +55,13 @@ impl Keypair {
                     privkey: signing_key,
                 })
             }
-            Err(e) => {
-                Err(e.into())
-            }
+            Err(e) => Err(e.into()),
         }
+    }
+
+    /// Return the 32 raw Ed25519 public-key bytes used as the NodeID.
+    pub fn node_id(&self) -> [u8; 32] {
+        self.pubkey.to_bytes()
     }
 }
 
@@ -67,6 +70,10 @@ impl fmt::Display for Keypair {
         // We could display private key.. if we wanted to.
         // We only display the public key we generated, to not expose any secrets.
         // The pubkey is displayed in a z-base32 encoding.
-        write!(f, "{}", base32::encode(Alphabet::Z, &self.pubkey.to_bytes()))
+        write!(
+            f,
+            "{}",
+            base32::encode(Alphabet::Z, &self.pubkey.to_bytes())
+        )
     }
 }

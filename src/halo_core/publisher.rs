@@ -1,21 +1,22 @@
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
+use local_ip_address::{local_ip, local_ipv6};
 use mp4::ReadBox;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{Notify, broadcast, watch};
 
 use moq_native_ietf::{quic, tls};
 use moq_transport::{
     coding::TrackNamespace,
     serve,
-    session::{transport::Session as TransportSession, Publisher, Transport},
+    session::{Publisher, Transport, transport::Session as TransportSession},
 };
 
 const DEFAULT_PORT: u16 = 4443;
@@ -45,7 +46,7 @@ struct Hub {
     first_peer: Notify,
 }
 
-pub async fn publish(file: &str) -> Result<()> {
+pub async fn publish(file: &str, node_id: [u8; 32]) -> Result<()> {
     // Is path valid?
     let path = Path::new(file);
     // Doesn't verify if it's real mp4 tho
@@ -56,24 +57,35 @@ pub async fn publish(file: &str) -> Result<()> {
     let (cert, key) = write_self_signed(dir.path())?;
 
     // Configure TLS arguments (no verification)
-    let mut tls_args = tls::Args {disable_verify: true, ..Default::default()};
+    let mut tls_args = tls::Args {
+        disable_verify: true,
+        ..Default::default()
+    };
     tls_args.cert.push(cert);
     tls_args.key.push(key);
     let tls = tls_args.load()?;
 
     // Prepare a raw QUIC endpoint (like subscriber)
     // 0.0.0.0:4443 (ipv4 only)
-    let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
-    let quic_config = quic::Config::new(v4, None, tls)?;
+    // let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
+
+    // Using ipv6 because each device has its own unique 128-bit address (no address translation)
+    let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
+
+    let quic_config = quic::Config::new(bind, None, tls)?;
     let endpoint = quic::Endpoint::new(quic_config)?;
-    
+
     let server = endpoint.server.context("TLS config missing")?;
     tracing::info!(listen = %server.local_addr()?, file=%path.display(), "publishing, waiting for subscribers");
+    let ip = local_ipv6().context("failed to determine the publisher IP")?;
+    let ticket = crate::halo_protocol::node::encode_ticket(&node_id, ip);
+    tracing::info!(ticket = %ticket, "publisher join ticket");
+    eprintln!("Publisher ticket: {ticket}");
 
     // The init segment is shared for all subscribers so they can decode the stream properly
     let (init, _) = watch::channel(None); // It gets populated when the first subscriber comes
-    // Broadcast channel for fragments, so every subscriber can read from it at the same time. Max fragments is 512 (because why not)
-    let (live, _) = broadcast::channel(512);
+    // Broadcast channel for fragments, so every subscriber can read from it at the same time. Max fragments is 1024 (because why not + audio track)
+    let (live, _) = broadcast::channel(1024);
     let hub = Arc::new(Hub {
         init,
         live,
@@ -82,7 +94,7 @@ pub async fn publish(file: &str) -> Result<()> {
 
     return tokio::select! {
         res = accept_loop(server, hub.clone()) => res,
-        res = run_ffmpeg(path, hub) => res, 
+        res = run_ffmpeg(path, hub) => res,
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
 }
@@ -114,9 +126,15 @@ async fn accept_loop(mut server: quic::Server, hub: Arc<Hub>) -> Result<()> {
 }
 
 /// Serve one subscriber with its own broadcast so it always get the init segment (ftyp + moov)
-async fn serve_peer(session: TransportSession, transport: Transport, hub: Arc<Hub>, name: String) -> Result<()> {
+async fn serve_peer(
+    session: TransportSession,
+    transport: Transport,
+    hub: Arc<Hub>,
+    name: String,
+) -> Result<()> {
     let (session, mut publisher) = Publisher::accept(session, transport)
-        .await.context("MoQ setup failed")?;
+        .await
+        .context("MoQ setup failed")?;
 
     hub.first_peer.notify_one();
 
@@ -149,9 +167,15 @@ async fn wait_for_init(hub: &Hub) -> Result<Bytes> {
 /// Feed one subscriber's "Media".
 /// Feeds init segment (with codec info, etc. to understand the coming data)
 /// Then live fragments starting from a keyframe.
-async fn feed_peer(mut media: moq_pub::Media, hub: Arc<Hub>, mut live: broadcast::Receiver<Fragment>) -> Result<()> {
+async fn feed_peer(
+    mut media: moq_pub::Media,
+    hub: Arc<Hub>,
+    mut live: broadcast::Receiver<Fragment>,
+) -> Result<()> {
     let mut init = wait_for_init(&hub).await?;
-    media.parse(&mut init).context("failed to publish the init segment")?;
+    media
+        .parse(&mut init)
+        .context("failed to publish the init segment")?;
 
     let mut started = false;
     loop {
@@ -159,7 +183,9 @@ async fn feed_peer(mut media: moq_pub::Media, hub: Arc<Hub>, mut live: broadcast
             Ok(mut fragment) => {
                 started |= fragment.keyframe;
                 if started {
-                    media.parse(&mut fragment.data).context("failed to publish a fragment")?;
+                    media
+                        .parse(&mut fragment.data)
+                        .context("failed to publish a fragment")?;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -180,7 +206,8 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner", // no copyright/version
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
             "-re", // read input at native frame rate
             "-stream_loop",
             "-1",
@@ -188,19 +215,43 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
         ])
         .arg(file)
         .args([
-            "-an",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?", // "?" = we can have an audio track, or not
+            // Video track flags
             "-c:v",
-            "libx264",
+            "libx264", // codec = H.264
             "-profile:v",
             "main",
-            "-preset","veryfast",
-            "-tune","zerolatency",
-            "-pix_fmt","yuv420p",
-            "-g","48",
-            "-keyint_min","48",
-            "-sc_threshold","0",
-            "-f","mp4",
-            "-movflags","empty_moov+frag_every_frame+separate_moof+omit_tfhd_offset",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p", // pixel format
+            "-g",
+            "48", // GOP (group of pictures) size. always begins with an I-frame (keyframe)
+            "-keyint_min",
+            "48", // minimum interval between I-frames
+            "-sc_threshold",
+            "0",
+            // Audio track flags
+            // the moq-pub crate supports only the AAC codec
+            "-c:a",
+            "aac", // codec
+            "-b:a",
+            "128k", // bitrate (128kbps)
+            "-ar",
+            "48000", // sampling frequency
+            "-ac",
+            "2", // number of audio channels (2 = stereo)
+            "-f",
+            "mp4",
+            "-movflags",
+            "empty_moov+separate_moof+omit_tfhd_offset",
+            "-frag_duration",
+            "1000",
             "-",
         ])
         .stdin(Stdio::null())
@@ -213,6 +264,8 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
     let mut buf = BytesMut::new();
     let mut init = BytesMut::new();
     let mut pending_moof: Option<(Bytes, bool)> = None;
+
+    let mut video_track: Option<u32> = None;
 
     loop {
         // We read the raw output from ffmpeg stdout: it outputs raw boxes (binary)
@@ -232,11 +285,13 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
                 b"ftyp" => init.extend_from_slice(&atom),
                 b"moov" => {
                     init.extend_from_slice(&atom);
+                    video_track = Some(find_video_track(&atom)?);
                     hub.init.send_replace(Some(init.split().freeze()));
                     tracing::info!("init segment ready");
                 }
                 b"moof" => {
-                    let keyframe = is_keyframe(&atom)?;
+                    let video = video_track.context("moof recieved before moov")?;
+                    let keyframe = is_video_keyframe(&atom, video)?;
                     pending_moof = Some((atom, keyframe));
                 }
                 b"mdat" => {
@@ -260,6 +315,18 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
     anyhow::bail!("ffmpeg exited unexpectedly: {status}")
 }
 
+// Find the track id of the H.264 (avc1) track (there is one video and one audio track, so this is to know which is which)
+fn find_video_track(moov_box: &[u8]) -> Result<u32> {
+    let mut reader = Cursor::new(moov_box);
+    let header = mp4::BoxHeader::read(&mut reader)?;
+    let moov = mp4::MoovBox::read_box(&mut reader, header.size)?;
+    moov.traks
+        .iter()
+        .find(|trak| trak.mdia.minf.stbl.stsd.avc1.is_some()) // is it AVC? (advanced video coding) => video track
+        .map(|trak| trak.tkhd.track_id) // fetch its track id
+        .context("ffmpeg output has no H.264 video track")
+}
+
 // MP4 files are structured as a sequence of "boxes".
 // As the output from ffmpeg is raw bytes, this function cuts this stream into boxes.
 fn next_box(buf: &mut BytesMut) -> Result<Option<Bytes>> {
@@ -271,7 +338,8 @@ fn next_box(buf: &mut BytesMut) -> Result<Option<Bytes>> {
     // Size is encoded as a big endian integer
     let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     anyhow::ensure!(size >= 8, "unsupported MP4 box size {size}");
-    if buf.len() < size { // The buffer doesn't contain the whole box yet
+    if buf.len() < size {
+        // The buffer doesn't contain the whole box yet
         return Ok(None);
     }
     // We return the box as immutable bytes and chop it off "buf" so it only contains the next stuff.
@@ -281,13 +349,16 @@ fn next_box(buf: &mut BytesMut) -> Result<Option<Bytes>> {
 // In H.264 some frames can be decoded on their own (I-frames, or "keyframes")
 // Some are dependent on other frames to be decoded (P/B-frames).
 // The subscriber needs to join on a keyframe to be able to understand the stream
-fn is_keyframe(moof_box: &[u8]) -> Result<bool> {
+fn is_video_keyframe(moof_box: &[u8], video_track: u32) -> Result<bool> {
     let mut reader = Cursor::new(moof_box);
     let header = mp4::BoxHeader::read(&mut reader)?;
     let moof = mp4::MoofBox::read_box(&mut reader, header.size)?;
 
     // Each moof box can contain multiple tracks "traf" (for example one audio and one video)
     for traf in &moof.trafs {
+        if traf.tfhd.track_id != video_track {
+            continue;
+        }
         let default_flags = traf.tfhd.default_sample_flags.unwrap_or_default();
         let Some(trun) = &traf.trun else {
             return Ok(false);
