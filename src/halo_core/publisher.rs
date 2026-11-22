@@ -80,8 +80,8 @@ pub async fn publish(file: &str, node_id: [u8; 32]) -> Result<()> {
 
     // The init segment is shared for all subscribers so they can decode the stream properly
     let (init, _) = watch::channel(None); // It gets populated when the first subscriber comes
-    // Broadcast channel for fragments, so every subscriber can read from it at the same time. Max fragments is 512 (because why not)
-    let (live, _) = broadcast::channel(512);
+    // Broadcast channel for fragments, so every subscriber can read from it at the same time. Max fragments is 1024 (because why not + audio track)
+    let (live, _) = broadcast::channel(1024);
     let hub = Arc::new(Hub {
         init,
         live,
@@ -211,26 +211,29 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
         ])
         .arg(file)
         .args([
-            "-c:v",
-            "libx264",
-            "-profile:v",
-            "main",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
-            "-pix_fmt",
-            "yuv420p",
-            "-g",
-            "48",
-            "-keyint_min",
-            "48",
-            "-sc_threshold",
-            "0",
-            "-f",
-            "mp4",
-            "-movflags",
-            "empty_moov+frag_every_frame+separate_moof+omit_tfhd_offset",
+            "-map", "0:v:0",
+            "-map", "0:a:0?", // "?" = we can have an audio track, or not
+
+            // Video track flags
+            "-c:v", "libx264", // codec = H.264
+            "-profile:v", "main",
+            "-preset","veryfast",
+            "-tune","zerolatency",
+            "-pix_fmt","yuv420p", // pixel format
+            "-g","48", // GOP (group of pictures) size. always begins with an I-frame (keyframe)
+            "-keyint_min","48", // minimum interval between I-frames
+            "-sc_threshold","0",
+
+            // Audio track flags
+            // the moq-pub crate supports only the AAC codec 
+            "-c:a", "aac", // codec
+            "-b:a", "128k", // bitrate (128kbps)
+            "-ar", "48000", // sampling frequency
+            "-ac", "2", // number of audio channels (2 = stereo)
+
+            "-f","mp4",
+            "-movflags","empty_moov+separate_moof+omit_tfhd_offset",
+            "-frag_duration", "1000",
             "-",
         ])
         .stdin(Stdio::null())
@@ -243,6 +246,8 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
     let mut buf = BytesMut::new();
     let mut init = BytesMut::new();
     let mut pending_moof: Option<(Bytes, bool)> = None;
+
+    let mut video_track: Option<u32> = None;
 
     loop {
         // We read the raw output from ffmpeg stdout: it outputs raw boxes (binary)
@@ -262,11 +267,13 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
                 b"ftyp" => init.extend_from_slice(&atom),
                 b"moov" => {
                     init.extend_from_slice(&atom);
+                    video_track = Some(find_video_track(&atom)?);
                     hub.init.send_replace(Some(init.split().freeze()));
                     tracing::info!("init segment ready");
                 }
                 b"moof" => {
-                    let keyframe = is_keyframe(&atom)?;
+                    let video = video_track.context("moof recieved before moov")?;
+                    let keyframe = is_video_keyframe(&atom, video)?;
                     pending_moof = Some((atom, keyframe));
                 }
                 b"mdat" => {
@@ -288,6 +295,18 @@ async fn run_ffmpeg(file: &Path, hub: Arc<Hub>) -> Result<()> {
 
     let status = child.wait().await?;
     anyhow::bail!("ffmpeg exited unexpectedly: {status}")
+}
+
+// Find the track id of the H.264 (avc1) track (there is one video and one audio track, so this is to know which is which)
+fn find_video_track(moov_box: &[u8]) -> Result<u32> {
+    let mut reader = Cursor::new(moov_box);
+    let header = mp4::BoxHeader::read(&mut reader)?;
+    let moov = mp4::MoovBox::read_box(&mut reader, header.size)?;
+    moov.traks
+        .iter()
+        .find(|trak| trak.mdia.minf.stbl.stsd.avc1.is_some()) // is it AVC? (advanced video coding) => video track
+        .map(|trak| trak.tkhd.track_id) // fetch its track id
+        .context("ffmpeg output has no H.264 video track")
 }
 
 // MP4 files are structured as a sequence of "boxes".
@@ -312,13 +331,16 @@ fn next_box(buf: &mut BytesMut) -> Result<Option<Bytes>> {
 // In H.264 some frames can be decoded on their own (I-frames, or "keyframes")
 // Some are dependent on other frames to be decoded (P/B-frames).
 // The subscriber needs to join on a keyframe to be able to understand the stream
-fn is_keyframe(moof_box: &[u8]) -> Result<bool> {
+fn is_video_keyframe(moof_box: &[u8], video_track: u32) -> Result<bool> {
     let mut reader = Cursor::new(moof_box);
     let header = mp4::BoxHeader::read(&mut reader)?;
     let moof = mp4::MoofBox::read_box(&mut reader, header.size)?;
 
     // Each moof box can contain multiple tracks "traf" (for example one audio and one video)
     for traf in &moof.trafs {
+        if traf.tfhd.track_id != video_track {
+            continue;
+        }
         let default_flags = traf.tfhd.default_sample_flags.unwrap_or_default();
         let Some(trun) = &traf.trun else {
             return Ok(false);
