@@ -1,12 +1,14 @@
+//! MoQ stream publisher.
+
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use local_ip_address::{local_ip, local_ipv6};
+use local_ip_address::local_ipv6;
 use mp4::ReadBox;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -16,10 +18,10 @@ use moq_native_ietf::{quic, tls};
 use moq_transport::{
     coding::TrackNamespace,
     serve,
-    session::{Publisher, Transport, transport::Session as TransportSession},
+    session::{Publisher as MoqPublisher, Transport, transport::Session as TransportSession},
 };
 
-const DEFAULT_PORT: u16 = 4443;
+use crate::halo_protocol::node::{DEFAULT_PORT, encode_ticket};
 
 // fMP4 (moof + mdat) fragment
 // Every subscriber starts video playback at a keyframe (I-frame)
@@ -46,66 +48,103 @@ struct Hub {
     first_peer: Notify,
 }
 
-pub async fn publish(file: &str, node_id: [u8; 32]) -> Result<()> {
-    // Is path valid?
-    let path = Path::new(file);
-    // Doesn't verify if it's real mp4 tho
-    anyhow::ensure!(path.is_file(), "video file not found: {}", path.display());
+/// Bound MoQ video publisher ready to serve subscribers.
+///
+/// Create with [`Publisher::bind`], share [`Publisher::ticket`] with subscribers,
+/// and await [`Publisher::run`].
+pub struct Publisher {
+    file: PathBuf,
+    ticket: String,
+    server: quic::Server,
+    _cert_dir: tempfile::TempDir,
+}
 
-    // Generate a temporary self-signed certificate in a temporary directory.
-    let dir = tempfile::tempdir().context("failed to create temp dir for certificate")?;
-    let (cert, key) = write_self_signed(dir.path())?;
+impl Publisher {
+    /// Validates `file`, binds the IPv6 QUIC endpoint on [`DEFAULT_PORT`],
+    /// and generates the join ticket for `node_id`.
+    ///
+    /// Must be called inside a Tokio runtime.
+    pub fn bind(file: impl AsRef<Path>, node_id: [u8; 32]) -> Result<Self> {
+        let path = file.as_ref();
+        // shortcut: checks file existence only, not MP4 container validity; upgrade when adding pre-flight probing
+        anyhow::ensure!(path.is_file(), "video file not found: {}", path.display());
 
-    // Configure TLS arguments (no verification)
-    let mut tls_args = tls::Args {
-        disable_verify: true,
-        ..Default::default()
-    };
-    tls_args.cert.push(cert);
-    tls_args.key.push(key);
-    let tls = tls_args.load()?;
+        let dir = tempfile::tempdir().context("failed to create temp dir for certificate")?;
+        let (cert, key) = write_self_signed(dir.path())?;
 
-    // Prepare a raw QUIC endpoint (like subscriber)
-    // 0.0.0.0:4443 (ipv4 only)
-    // let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
+        let mut tls_args = tls::Args {
+            disable_verify: true,
+            ..Default::default()
+        };
+        tls_args.cert.push(cert);
+        tls_args.key.push(key);
+        let tls = tls_args.load()?;
 
-    // Using ipv6 because each device has its own unique 128-bit address (no address translation)
-    let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
+        // IPv6 gives each device a routable 128-bit address without NAT.
+        let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT);
+        let quic_config = quic::Config::new(bind, None, tls)?;
+        let endpoint = quic::Endpoint::new(quic_config)?;
 
-    let quic_config = quic::Config::new(bind, None, tls)?;
-    let endpoint = quic::Endpoint::new(quic_config)?;
+        let server = endpoint.server.context("TLS config missing")?;
+        let ip = local_ipv6().context("failed to determine the publisher IP")?;
+        let ticket = encode_ticket(&node_id, ip);
 
-    let server = endpoint.server.context("TLS config missing")?;
-    tracing::info!(listen = %server.local_addr()?, file=%path.display(), "publishing, waiting for subscribers");
-    let ip = local_ipv6().context("failed to determine the publisher IP")?;
-    let ticket = crate::halo_protocol::node::encode_ticket(&node_id, ip);
-    tracing::info!(ticket = %ticket, "publisher join ticket");
-    eprintln!("Publisher ticket: {ticket}");
+        tracing::info!(
+            listen = %server.local_addr()?,
+            file = %path.display(),
+            ticket = %ticket,
+            "publisher ready, waiting for subscribers"
+        );
 
-    // The init segment is shared for all subscribers so they can decode the stream properly
-    let (init, _) = watch::channel(None); // It gets populated when the first subscriber comes
-    // Broadcast channel for fragments, so every subscriber can read from it at the same time. Max fragments is 1024 (because why not + audio track)
-    let (live, _) = broadcast::channel(1024);
-    let hub = Arc::new(Hub {
-        init,
-        live,
-        first_peer: Notify::new(),
-    });
+        Ok(Self {
+            file: path.to_path_buf(),
+            ticket,
+            server,
+            _cert_dir: dir,
+        })
+    }
 
-    return tokio::select! {
-        res = accept_loop(server, hub.clone()) => res,
-        res = run_ffmpeg(path, hub) => res,
-        _ = tokio::signal::ctrl_c() => Ok(()),
-    };
+    /// Returns the z-base32 join ticket subscribers use to connect to this publisher.
+    pub fn ticket(&self) -> &str {
+        &self.ticket
+    }
+
+    /// Returns the local socket address the QUIC server is listening on.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.server.local_addr()?)
+    }
+
+    /// Accepts subscribers and streams the video file via `ffmpeg` until stopped or an error occurs.
+    ///
+    /// Callers handle cancellation (e.g., Ctrl+C) by dropping or `tokio::select!`-ing this future.
+    pub async fn run(self) -> Result<()> {
+        let (init, _) = watch::channel(None);
+        let (live, _) = broadcast::channel(1024);
+        let hub = Arc::new(Hub {
+            init,
+            live,
+            first_peer: Notify::new(),
+        });
+
+        let Self {
+            file,
+            server,
+            _cert_dir,
+            ..
+        } = self;
+
+        tokio::select! {
+            res = accept_loop(server, hub.clone()) => res,
+            res = run_ffmpeg(&file, hub) => res,
+        }
+    }
 }
 
 /// Accept new subscriber connections.
 async fn accept_loop(mut server: quic::Server, hub: Arc<Hub>) -> Result<()> {
     // Hardcoded = not good!
     let name = String::from("shrek");
-    // Server accepts connections. When one is recieved:
     while let Some((session, info)) = server.accept().await {
-        // Get info for that connection (who is connecting?)
         let quic::ConnInfo {
             id,
             transport,
@@ -114,7 +153,6 @@ async fn accept_loop(mut server: quic::Server, hub: Arc<Hub>) -> Result<()> {
         } = info;
         let hub = hub.clone();
         let name = name.clone();
-        // Each connection spawns a thread and we'll serve them the stream data.
         tokio::spawn(async move {
             tracing::info!(peer=%remote_address, cid=%id, "subscriber connected");
             if let Err(err) = serve_peer(session, transport, hub, name).await {
@@ -125,14 +163,14 @@ async fn accept_loop(mut server: quic::Server, hub: Arc<Hub>) -> Result<()> {
     Ok(())
 }
 
-/// Serve one subscriber with its own broadcast so it always get the init segment (ftyp + moov)
+/// Serve one subscriber with its own broadcast so it always gets the init segment (ftyp + moov).
 async fn serve_peer(
     session: TransportSession,
     transport: Transport,
     hub: Arc<Hub>,
     name: String,
 ) -> Result<()> {
-    let (session, mut publisher) = Publisher::accept(session, transport)
+    let (session, mut publisher) = MoqPublisher::accept(session, transport)
         .await
         .context("MoQ setup failed")?;
 
@@ -403,4 +441,70 @@ fn write_self_signed(dir: &Path) -> Result<(PathBuf, PathBuf)> {
     std::fs::write(&cert, certified.cert.pem())?;
     std::fs::write(&key, certified.signing_key.serialize_pem())?;
     Ok((cert, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(size as usize);
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn make_moof(track_id: u32, default_sample_flags: u32) -> Vec<u8> {
+        let mfhd = mp4_box(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let mut tfhd_payload = Vec::new();
+        tfhd_payload.extend_from_slice(&[0, 0, 0, 0x20]); // version=0, FLAG_DEFAULT_SAMPLE_FLAGS
+        tfhd_payload.extend_from_slice(&track_id.to_be_bytes());
+        tfhd_payload.extend_from_slice(&default_sample_flags.to_be_bytes());
+        let tfhd = mp4_box(b"tfhd", &tfhd_payload);
+
+        let trun = mp4_box(b"trun", &[0, 0, 0, 0, 0, 0, 0, 1]); // 1 sample using tfhd defaults
+
+        let mut traf_payload = tfhd;
+        traf_payload.extend_from_slice(&trun);
+        let traf = mp4_box(b"traf", &traf_payload);
+
+        let mut moof_payload = mfhd;
+        moof_payload.extend_from_slice(&traf);
+        mp4_box(b"moof", &moof_payload)
+    }
+
+    #[test]
+    fn next_box_handles_partial_complete_and_invalid_boxes() {
+        let mut buf = BytesMut::from(&[0, 0, 0, 10, b'f', b't', b'y', b'p'][..]);
+        assert!(next_box(&mut buf).unwrap().is_none());
+
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        let atom = next_box(&mut buf).unwrap().unwrap();
+        assert_eq!(atom.len(), 10);
+        assert_eq!(&atom[4..8], b"ftyp");
+        assert_eq!(buf.len(), 2);
+
+        let mut invalid = BytesMut::from(&[0, 0, 0, 4, b'b', b'a', b'd', b'!'][..]);
+        assert!(next_box(&mut invalid).is_err());
+    }
+
+    #[test]
+    fn detects_video_keyframes_and_ignores_other_tracks() {
+        // depends_on_none (bits 24..26 = 2) and non_sync (bit 16 = 0)
+        let keyframe_flags = 0x0200_0000;
+        let non_keyframe_flags = 0x0101_0000;
+
+        assert!(is_video_keyframe(&make_moof(1, keyframe_flags), 1).unwrap());
+        assert!(!is_video_keyframe(&make_moof(1, non_keyframe_flags), 1).unwrap());
+        assert!(!is_video_keyframe(&make_moof(2, keyframe_flags), 1).unwrap());
+    }
+
+    #[test]
+    fn bind_rejects_missing_video_file() {
+        let res = Publisher::bind("/nonexistent/halo-missing-video.mp4", [0u8; 32]);
+        assert!(res.is_err());
+    }
 }

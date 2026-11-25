@@ -1,4 +1,4 @@
-# Contributing to halod
+# Contributing to halo
 
 Contributions are restricted to the HALO team; therefore we will ignore all external pull requests or issues. Any part of this document might change in the future.
 

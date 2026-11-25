@@ -1,5 +1,5 @@
 [package]
-name = "halod"
+name = "halo"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1.0.104"
 base32 = "0.5.1"
 bytes = "1.12.1"
-clap = { version = "4.6.7", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
 local-ip-address = "0.6.13"
 moq-native-ietf = "0.11.0"
@@ -20,5 +19,4 @@ rcgen = "0.14.10"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full", "macros", "rt-multi-thread"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5.8"

@@ -1,10 +1,13 @@
-# halod
+# halo
 
-The backend daemon for the HALO streaming protocol. Divided in three modules:
+The Rust crate implementing the HALO video streaming protocol over Media over QUIC (MoQ). To be used by `halo-cli` and the OPSYS frontend desktop client.
 
-- **halo-protocol**: structures and data definitions for the protocol
-- **halo-core**: the engine of the protocol (doing the calculations) 
-- **halo-api**: what we're exposing to the OPSYS frontend client
+## Docs & Tests
+
+```bash
+cargo test
+cargo doc --no-deps --open
+```
 
 ## Contributing
 
