@@ -1,23 +1,39 @@
-use anyhow::Result;
-use moq_native_ietf::{quic, reexports::anyhow::Context, tls};
+//! MoQ stream subscriber.
+
+use anyhow::{Context, Result};
+use moq_native_ietf::{quic, tls};
 use moq_transport::{serve, session::Subscriber};
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::io::AsyncWrite;
 use tracing::{Level, event};
 use url::Url;
 
-/// Connect to a MoQ publisher over raw QUIC, subscribe to a stream
-/// and output video to stdout.
-pub async fn subscribe(addr: SocketAddr) -> Result<()> {
-    // The TLS config we load disables verification entirely.
-    // This way, self-signed certs are valid. We'll take care of TLS later.
+/// Connects to a MoQ publisher over raw QUIC, subscribes to its announced stream,
+/// and writes the received fragmented MP4 bytes into `output`.
+///
+/// The future runs until the stream or session ends. Callers that want interactive
+/// cancellation (such as Ctrl+C in a CLI or a stop button in a GUI) should cancel
+/// or `tokio::select!` this future.
+///
+/// # Examples
+/// ```no_run
+/// # async fn run(ticket: &str) -> anyhow::Result<()> {
+/// let addr = halo::parse_ticket(ticket)?;
+/// halo::subscribe(addr, tokio::io::stdout()).await
+/// # }
+/// ```
+pub async fn subscribe<W>(addr: SocketAddr, output: W) -> Result<()>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    // Disable TLS verification so throwaway self-signed publisher certs are accepted.
     let tls = tls::Args {
         disable_verify: true,
         ..Default::default()
     }
     .load()?;
 
-    // Make a raw QUIC endpoint. We'll bind it to localhost port "0" which means any random (high) ephemeral port
     let bind: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse()?
     } else {
@@ -30,30 +46,21 @@ pub async fn subscribe(addr: SocketAddr) -> Result<()> {
     let url = Url::parse(&format!("moqt://{addr}"))?;
     event!(Level::INFO, "connecting to {url}");
 
-    // Try to connect to the moqt:// url
     let (session, cid, transport) = endpoint
         .client
         .connect(&url, None)
         .await
-        .with_context(|| format!("failed to connect"))?;
+        .context("failed to connect")?;
     event!(Level::INFO, "connected, cid={cid}");
 
     let (session, subscriber) = Subscriber::connect(session, transport)
         .await
         .context("MoQ setup failed")?;
 
-    // For now all video we recieve will be outputted to standard output.
-    // Right now the display setup will be to pipe halod's stdout to
-    // ffplay, which will display the video in a new window.
-    // Soon(tm) we want to have some kind of IPC with the Opsys frontend
-    // and give the video there.
-    let output = Box::new(tokio::io::stdout());
-
     let receive = async move {
         // The publisher announces its namespace right after setup. Wait for it, accept it,
         // and subscribe to that namespace.
         let mut announces = subscriber.clone();
-        // moq-transport gives us a good abstraction to just fetch the last published namespace
         let mut announced =
             tokio::time::timeout(Duration::from_secs(10), announces.published_namespace())
                 .await
@@ -74,6 +81,5 @@ pub async fn subscribe(addr: SocketAddr) -> Result<()> {
     tokio::select! {
         res = session.run() => res.context("session error"),
         res = receive => res,
-        _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
