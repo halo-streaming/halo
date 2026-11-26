@@ -1,10 +1,7 @@
-mod halo_core;
-mod halo_protocol;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use halo_core::keypair::Keypair;
-use std::error::Error;
+use halod::{Keypair, Publisher, parse_ticket, subscribe};
+use std::net::SocketAddr;
 use tracing::{Level, event};
 use tracing_subscriber::EnvFilter;
 
@@ -18,14 +15,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Publish a video from a file, using MoQ
-    Publish { video_path: String },
+    Publish {
+        video_path: String,
+        /// Optional external discovery server address (e.g. [2001:db8::1]:4444)
+        #[arg(long)]
+        discovery: Option<SocketAddr>,
+    },
 
     /// Subscribe to a MoQ stream using a ticket
-    Subscribe { ticket: String },
+    Subscribe {
+        ticket: String,
+        /// Optional external discovery server address (e.g. [2001:db8::1]:4444)
+        #[arg(long)]
+        discovery: Option<SocketAddr>,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Enable tracing display on terminal. The EnvFilter enables us to add DEBUG output
@@ -43,18 +50,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     event!(Level::INFO, "pubkey for this node is {k}");
 
     match cli.command {
-        Commands::Publish { video_path } => {
+        Commands::Publish {
+            video_path,
+            discovery,
+        } => {
             eprintln!("Publishing {video_path}");
-            halo_core::publisher::publish(&video_path, k.node_id()).await?;
+            let publisher = Publisher::bind(&video_path, k.node_id(), discovery).await?;
+            eprintln!("Publisher ticket: {}", publisher.ticket());
+            tokio::select! {
+                res = publisher.run() => res?,
+                _ = tokio::signal::ctrl_c() => {}
+            }
         }
-        Commands::Subscribe { ticket } => {
+        Commands::Subscribe { ticket, discovery } => {
             // Printing anything to stdout can corrupt the pipe to ffplay
             eprintln!("Subscribing to {ticket}");
-            halo_core::subscriber::subscribe(
-                halo_protocol::node::parse_ticket(&ticket)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
-            )
-            .await?;
+            let addr = parse_ticket(&ticket)?;
+            tokio::select! {
+                res = subscribe(addr, tokio::io::stdout(), discovery) => res?,
+                _ = tokio::signal::ctrl_c() => {}
+            }
         }
     }
 

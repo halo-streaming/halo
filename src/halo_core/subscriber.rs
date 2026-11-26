@@ -1,14 +1,22 @@
 use anyhow::Result;
 use moq_native_ietf::{quic, reexports::anyhow::Context, tls};
 use moq_transport::{serve, session::Subscriber};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
+use tokio::io::AsyncWrite;
 use tracing::{Level, event};
 use url::Url;
 
 /// Connect to a MoQ publisher over raw QUIC, subscribe to a stream
-/// and output video to stdout.
-pub async fn subscribe(addr: SocketAddr) -> Result<()> {
+/// and write the received fMP4 bytes to `output`.
+pub async fn subscribe<O>(
+    addr: SocketAddr,
+    output: O,
+    discovery: Option<SocketAddr>,
+) -> Result<()>
+where
+    O: AsyncWrite + Send + Unpin + 'static,
+{
     // The TLS config we load disables verification entirely.
     // This way, self-signed certs are valid. We'll take care of TLS later.
     let tls = tls::Args {
@@ -17,13 +25,22 @@ pub async fn subscribe(addr: SocketAddr) -> Result<()> {
     }
     .load()?;
 
-    // Make a raw QUIC endpoint. We'll bind it to localhost port "0" which means any random (high) ephemeral port
+    // Make a raw QUIC endpoint. We'll bind it to port "0" which means any random (high) ephemeral port
     let bind: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse()?
     } else {
         "[::]:0".parse()?
     };
-    let quic_config = quic::Config::new(bind, None, tls).context("QUIC config creation failed")?;
+    let socket = UdpSocket::bind(bind).context("UDP bind failed")?;
+
+    if let Some(server) = discovery {
+        let observed = crate::halo_core::discovery::discover_external_addr(&socket, server).await?;
+        tracing::info!(%observed, "subscriber external address discovered");
+    }
+
+    let (thief_wrapper, mut thief) = crate::halo_core::thief_socket::thief_socket_pair();
+    let quic_config =
+        quic::Config::with_socket(socket, None, tls).with_socket_wrapper(thief_wrapper);
     let endpoint = quic::Endpoint::new(quic_config).context("QUIC endpoint creation failed")?;
 
     // moqt:// is for raw QUIC, https:// would be for WebTransport
@@ -41,13 +58,6 @@ pub async fn subscribe(addr: SocketAddr) -> Result<()> {
     let (session, subscriber) = Subscriber::connect(session, transport)
         .await
         .context("MoQ setup failed")?;
-
-    // For now all video we recieve will be outputted to standard output.
-    // Right now the display setup will be to pipe halod's stdout to
-    // ffplay, which will display the video in a new window.
-    // Soon(tm) we want to have some kind of IPC with the Opsys frontend
-    // and give the video there.
-    let output = Box::new(tokio::io::stdout());
 
     let receive = async move {
         // The publisher announces its namespace right after setup. Wait for it, accept it,
@@ -71,9 +81,16 @@ pub async fn subscribe(addr: SocketAddr) -> Result<()> {
         res
     };
 
+    let punch_loop = async move {
+        while let Some(punch) = thief.recv_punch().await {
+            tracing::info!(from = %punch.from, has_node_id = punch.node_id.is_some(), "received HALO_PUNCH");
+        }
+        std::future::pending::<Result<()>>().await
+    };
+
     tokio::select! {
         res = session.run() => res.context("session error"),
         res = receive => res,
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        res = punch_loop => res,
     }
 }
